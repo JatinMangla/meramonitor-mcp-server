@@ -19,7 +19,7 @@ as an ordinary Node process, so nothing here is a one-way door.
    ```
    MM_ENV=production
    MCP_AUTH_MODE=self-hosted
-   MM_LOGIN_DOMAIN=meramonitor.com
+   MM_LOGIN_DOMAIN=app.mera.work
    MCP_TOKEN_TTL_SECONDS=28800
    MM_MAX_SCREENSHOTS_PER_CALL=4
    MCP_PUBLIC_URL=<the final public URL, no trailing slash>
