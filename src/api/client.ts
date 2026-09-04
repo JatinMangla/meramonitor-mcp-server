@@ -1,4 +1,6 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
+import { Agent as HttpAgent } from 'node:http';
+import { Agent as HttpsAgent } from 'node:https';
 
 /** The caller's MeraMonitor token is missing, expired, or rejected. */
 export class MeraMonitorAuthError extends Error {
@@ -31,6 +33,36 @@ export class MeraMonitorApiError extends Error {
 export const DEFAULT_TIMEOUT_MS = 25_000;
 
 /**
+ * Connection pooling for MeraMonitor calls.
+ *
+ * Without these axios opens a new socket per request, so every call pays a
+ * fresh TCP + TLS handshake - and a single tool call makes two or three calls.
+ * Reusing the connection removes that handshake from all but the first.
+ *
+ * Module scope is correct here and does not violate the serverless invariant
+ * in HANDOFF §5: an agent is a connection pool, not request state. Nothing a
+ * request depends on for correctness is stored in it, and a cold start simply
+ * begins with an empty pool. Sockets are per-instance, so nothing is shared
+ * between callers either.
+ *
+ * `maxSockets` is deliberately small: one function instance serves one request
+ * at a time, and the parallel work inside a tool is a handful of calls at most.
+ */
+const KEEP_ALIVE_MS = 30_000;
+
+const httpAgent = new HttpAgent({
+  keepAlive: true,
+  keepAliveMsecs: KEEP_ALIVE_MS,
+  maxSockets: 16
+});
+
+const httpsAgent = new HttpsAgent({
+  keepAlive: true,
+  keepAliveMsecs: KEEP_ALIVE_MS,
+  maxSockets: 16
+});
+
+/**
  * The single place that knows how to talk to the MeraMonitor API.
  *
  * Two conventions this centralises, because they are inconsistent per verb and
@@ -53,7 +85,9 @@ export class MeraMonitorClient {
     this.http = axios.create({
       baseURL: baseUrl.replace(/\/+$/, ''),
       timeout: timeoutMs,
-      headers: { Accept: 'application/json' }
+      headers: { Accept: 'application/json' },
+      httpAgent,
+      httpsAgent
     });
   }
 

@@ -4,8 +4,11 @@ import {
   assertRangeIsSane,
   formatSeconds,
   nowApiDateTime,
+  resolveDay,
+  resolveRange,
   toApiDateTime,
-  toApiDayStart
+  toApiDayStart,
+  PERIOD_NAMES
 } from '../api/dates.js';
 import { isAdminRole } from '../auth/meramonitor.js';
 import { resolveUser } from './identity.js';
@@ -80,19 +83,20 @@ export function registerTimeClaimTools(server: McpServer, ctx: ToolContext): voi
         'with their start, end and duration. This is the list you pick from when claiming.',
       inputSchema: {
         user: z.string().optional().describe('Name, email, or userId. Defaults to you.'),
-        date: z.string().describe('Which day, as YYYY-MM-DD')
+        date: z.string().describe('Which day: YYYY-MM-DD, or "today" / "yesterday"')
       },
       annotations: { readOnlyHint: true, openWorldHint: true }
     },
     async ({ user, date }, extra) =>
       guard(async () => {
         const identity = identityOf(extra);
+        const day = resolveDay(date, identity.orgTimeZoneName);
         const target = user ? await resolveUser(ctx, identity, user) : null;
 
         const data = await ctx.clientFor(identity).get<ClaimableResponse>('/TimeClaim/GetUserTimeToClaim', {
           UserId: target?.userId ?? identity.userId,
           OrganizationId: identity.organizationId,
-          FromDate: toApiDayStart(date)
+          FromDate: toApiDayStart(day)
         });
 
         const details = (data?.details ?? []).map(d => ({
@@ -110,7 +114,7 @@ export function registerTimeClaimTools(server: McpServer, ctx: ToolContext): voi
           user: target
             ? { userId: target.userId, fullName: target.fullName }
             : { userId: identity.userId, fullName: identity.fullName },
-          date,
+          date: day,
           firstActivity: data?.firstActivity,
           lastActivity: data?.lastActivity,
           totals: {
@@ -135,16 +139,24 @@ export function registerTimeClaimTools(server: McpServer, ctx: ToolContext): voi
         'Time claim requests over a date range with their approval status (pending, approved, rejected).',
       inputSchema: {
         user: z.string().optional().describe('Name, email, or userId. Defaults to you.'),
-        fromDate: z.string().describe('Start of the range, YYYY-MM-DD'),
-        toDate: z.string().describe('End of the range, YYYY-MM-DD'),
+        period: z
+          .enum(PERIOD_NAMES)
+          .optional()
+          .describe('Relative range, resolved in the organization timezone. Prefer this.'),
+        fromDate: z
+          .string()
+          .optional()
+          .describe('Start of an explicit range: YYYY-MM-DD, or "today" / "yesterday".'),
+        toDate: z.string().optional().describe('End of an explicit range (inclusive).'),
         status: z.string().optional().describe('Filter client-side by claim status, e.g. Pending')
       },
       annotations: { readOnlyHint: true, openWorldHint: true }
     },
-    async ({ user, fromDate, toDate, status }, extra) =>
+    async ({ user, period, fromDate, toDate, status }, extra) =>
       guard(async () => {
         const identity = identityOf(extra);
-        assertRangeIsSane(fromDate, toDate);
+        const range = resolveRange({ period, fromDate, toDate }, identity.orgTimeZoneName);
+        assertRangeIsSane(range.fromDate, range.toDate);
         const target = user ? await resolveUser(ctx, identity, user) : null;
 
         const rows = await ctx
@@ -152,8 +164,8 @@ export function registerTimeClaimTools(server: McpServer, ctx: ToolContext): voi
           .get<ClaimStatusRow[]>('/TimeClaim/GetAllClaimTimeStatus', {
             OrganizationId: identity.organizationId,
             UserId: target?.userId ?? identity.userId,
-            FromDate: toApiDayStart(fromDate),
-            ToDate: toApiDayStart(toDate),
+            FromDate: toApiDayStart(range.fromDate),
+            ToDate: toApiDayStart(range.toDate),
             UserType: identity.roleName
           });
 
@@ -164,7 +176,7 @@ export function registerTimeClaimTools(server: McpServer, ctx: ToolContext): voi
         }
 
         return json({
-          range: { fromDate, toDate },
+          range: { ...range, ...(period ? { period } : {}) },
           count: list.length,
           claims: list.map(r => ({
             timeClaimId: r.timeClaimId,

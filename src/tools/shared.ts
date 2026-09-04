@@ -2,6 +2,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { ServerRequest, ServerNotification } from '@modelcontextprotocol/sdk/types.js';
 import type { Config } from '../config.js';
+import { createCache, requestScoped, type Cache } from '../cache.js';
 import { MeraMonitorClient } from '../api/client.js';
 import type { MeraMonitorIdentity } from '../auth/meramonitor.js';
 
@@ -9,19 +10,29 @@ export type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 export interface ToolContext {
   config: Config;
+  /** Short-lived read cache. See src/cache.ts for what may and may not go in it. */
+  cache: Cache;
   /** A client bound to the MeraMonitor token carried by the caller's OAuth token. */
   clientFor(identity: MeraMonitorIdentity): MeraMonitorClient;
+  /**
+   * A copy of this context whose cache also memoises within the single request
+   * it serves. app.ts calls this once per POST /mcp, so ten lookups of the same
+   * key inside one tool call cost one round trip and nothing survives the
+   * response.
+   */
+  forRequest(): ToolContext;
 }
 
-export function createToolContext(config: Config): ToolContext {
+export function createToolContext(config: Config, cache: Cache = createCache(config)): ToolContext {
+  const clientFor = (identity: MeraMonitorIdentity) =>
+    new MeraMonitorClient(config.baseUrl, async () => identity.accessToken, config.apiTimeoutMs);
+
   return {
     config,
-    clientFor(identity: MeraMonitorIdentity) {
-      return new MeraMonitorClient(
-        config.baseUrl,
-        async () => identity.accessToken,
-        config.apiTimeoutMs
-      );
+    cache,
+    clientFor,
+    forRequest() {
+      return { ...this, cache: requestScoped(cache) };
     }
   };
 }

@@ -1,9 +1,9 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { toApiDayStart } from '../api/dates.js';
+import { resolveDay, toApiDayStart } from '../api/dates.js';
 import type { MeraMonitorIdentity } from '../auth/meramonitor.js';
-import { fetchOrgUsers, resolveUser } from './identity.js';
+import { fetchOrgUsers, resolveUser, resolveUsers } from './identity.js';
 import { failure, guard, identityOf, json, type ToolContext } from './shared.js';
 
 interface BlobThumbnail {
@@ -87,17 +87,19 @@ export function registerScreenshotTools(server: McpServer, ctx: ToolContext): vo
       title: 'List screenshot activity by hour',
       description:
         'Day-wise screenshot overview for one person: how many screenshots exist in each hour slot, ' +
-        'plus the path of each one. Returns NO image data - start here, then pass specific paths to ' +
-        'get_screenshots for the hours that matter.',
+        'plus the path of each one. Only hours that actually contain screenshots are listed; ' +
+        'totalScreenshots is the whole day. Returns NO image data - start here, then pass ' +
+        'specific paths to get_screenshots for the hours that matter.',
       inputSchema: {
         user: z.string().describe('Name, email, or userId of the person to look at'),
-        date: z.string().describe('Which day, as YYYY-MM-DD')
+        date: z.string().describe('Which day: YYYY-MM-DD, or "today" / "yesterday"')
       },
       annotations: { readOnlyHint: true, openWorldHint: true }
     },
     async ({ user, date }, extra) =>
       guard(async () => {
         const identity = identityOf(extra);
+        const day = resolveDay(date, identity.orgTimeZoneName);
         const target = await resolveUser(ctx, identity, user);
 
         const rows = await ctx
@@ -106,7 +108,7 @@ export function registerScreenshotTools(server: McpServer, ctx: ToolContext): vo
             organizationId: identity.organizationId,
             userId: target.userId,
             email: target.email,
-            reportDate: toApiDayStart(date)
+            reportDate: toApiDayStart(day)
           });
 
         const hours = (Array.isArray(rows) ? rows : []).map(row => ({
@@ -122,9 +124,10 @@ export function registerScreenshotTools(server: McpServer, ctx: ToolContext): vo
 
         return json({
           user: { userId: target.userId, fullName: target.fullName, email: target.email },
-          date,
+          date: day,
           totalScreenshots: total,
-          hours
+          // Hours with no screenshots carry no information and are dropped.
+          hours: hours.filter(h => h.count > 0 || h.paths.length > 0)
         });
       })
   );
@@ -141,7 +144,9 @@ export function registerScreenshotTools(server: McpServer, ctx: ToolContext): vo
         'Every call is written to the MeraMonitor audit log.',
       inputSchema: {
         user: z.string().describe('Name, email, or userId - must match the paths requested'),
-        date: z.string().describe('The day those paths came from, as YYYY-MM-DD'),
+        date: z
+          .string()
+          .describe('The day those paths came from: YYYY-MM-DD, or "today" / "yesterday"'),
         paths: z
           .array(z.string())
           .min(1)
@@ -157,6 +162,7 @@ export function registerScreenshotTools(server: McpServer, ctx: ToolContext): vo
     async ({ user, date, paths, fullSize, reason }, extra) =>
       guard(async () => {
         const identity = identityOf(extra);
+        const day = resolveDay(date, identity.orgTimeZoneName);
         const target = await resolveUser(ctx, identity, user);
 
         const cap = ctx.config.maxScreenshotsPerCall;
@@ -167,22 +173,31 @@ export function registerScreenshotTools(server: McpServer, ctx: ToolContext): vo
           );
         }
 
-        const rows = await ctx
-          .clientFor(identity)
-          .post<UserScreenshot[]>('/CloudStorageScreenshots/GetUserScreenshots', {
+        // The image fetch and the audit write are independent, so they run
+        // together rather than one after the other - this is the slowest tool
+        // and that was a whole serialised round trip.
+        //
+        // The ordering change is deliberate in one respect: the audit entry is
+        // now written even if the fetch then fails. For an audit log that is
+        // the safe direction - recording an attempt that returned nothing is a
+        // far smaller problem than a successful view that went unrecorded.
+        // writeAuditLog never throws, so Promise.all cannot lose the images to
+        // an audit failure.
+        const [rows, auditError] = await Promise.all([
+          ctx.clientFor(identity).post<UserScreenshot[]>('/CloudStorageScreenshots/GetUserScreenshots', {
             organizationId: identity.organizationId,
             userId: target.userId,
-            reportDate: toApiDayStart(date),
+            reportDate: toApiDayStart(day),
             pathList: paths,
             isThumbNail: fullSize !== true
-          });
-
-        const auditError = await writeAuditLog(
-          ctx,
-          identity,
-          target.userId,
-          reason ?? `Viewed ${paths.length} screenshot(s) for ${date} via MCP`
-        );
+          }),
+          writeAuditLog(
+            ctx,
+            identity,
+            target.userId,
+            reason ?? `Viewed ${paths.length} screenshot(s) for ${day} via MCP`
+          )
+        ]);
 
         const images = (Array.isArray(rows) ? rows : []).filter(r => r.data);
 
@@ -210,7 +225,7 @@ export function registerScreenshotTools(server: McpServer, ctx: ToolContext): vo
 
         const summary =
           `${included.length} of ${images.length} screenshot(s) returned for ` +
-          `${target.fullName ?? target.email} on ${date} ` +
+          `${target.fullName ?? target.email} on ${day} ` +
           `(${fullSize === true ? 'full size' : 'thumbnails'}, ` +
           `~${(usedBytes / 1_000_000).toFixed(2)} MB of a ${(RESPONSE_BYTE_BUDGET / 1_000_000).toFixed(1)} MB budget).`;
 
@@ -259,35 +274,45 @@ export function registerScreenshotTools(server: McpServer, ctx: ToolContext): vo
           .array(z.string())
           .optional()
           .describe('Names, emails, or userIds. Omit to check everyone in the organization.'),
-        date: z.string().describe('Which day, as YYYY-MM-DD')
+        date: z.string().describe('Which day: YYYY-MM-DD, or "today" / "yesterday"')
       },
       annotations: { readOnlyHint: true, openWorldHint: true }
     },
     async ({ users, date }, extra) =>
       guard(async () => {
         const identity = identityOf(extra);
+        const day = resolveDay(date, identity.orgTimeZoneName);
 
-        let userIds: string[];
-        if (users && users.length > 0) {
-          userIds = [];
-          for (const u of users) {
-            userIds.push((await resolveUser(ctx, identity, u)).userId);
-          }
-        } else {
-          userIds = (await fetchOrgUsers(ctx, identity))
-            .filter(u => u.isActive !== false)
-            .map(u => u.userId);
-        }
+        // resolveUsers matches every name against ONE roster fetch. This used
+        // to be a `for` loop with an await inside, so ten names meant ten
+        // sequential fetches of the same full organization list before the
+        // real call could even start.
+        const roster =
+          users && users.length > 0
+            ? await resolveUsers(ctx, identity, users)
+            : (await fetchOrgUsers(ctx, identity)).filter(u => u.isActive !== false);
+
+        const userIds = roster.map(u => u.userId);
+        const nameById = new Map(roster.map(u => [u.userId, u.fullName ?? u.email]));
 
         const withData = await ctx
           .clientFor(identity)
           .post<string[]>('/CloudStorageScreenshots/GetScreenshotsExistUserList', {
             organizationId: identity.organizationId,
             userIds,
-            reportDate: toApiDayStart(date)
+            reportDate: toApiDayStart(day)
           });
 
-        return json({ date, checked: userIds.length, withScreenshots: withData ?? [] });
+        const found = new Set(withData ?? []);
+
+        return json({
+          date: day,
+          checked: userIds.length,
+          // Names alongside the ids: the answer to "who has screenshots" is a
+          // list of people, and returning bare GUIDs forced a second lookup.
+          withScreenshots: [...found].map(id => ({ userId: id, name: nameById.get(id) })),
+          withoutScreenshots: userIds.filter(id => !found.has(id)).length
+        });
       })
   );
 }

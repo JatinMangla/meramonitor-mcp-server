@@ -52,10 +52,27 @@ Redis key layout:
 | `code:<code>` | authorization code | 10 minutes, deleted on use (`GETDEL`) |
 | `token:<access_token>` | issued token + bound MeraMonitor identity | `MCP_TOKEN_TTL_SECONDS` |
 | `refresh:<refresh_token>` | pointer to its access token | token TTL + 30 days |
+| `roster:<org_id>:<user_id>` | cached organization user list (read cache, not auth state) | 90 seconds |
 
 Without Redis credentials the store falls back to in-memory plus `MCP_CLIENTS_FILE`, exactly as the
 pre-port build behaved. That path is for local development and the self-hosted fallback only —
 start-up refuses it on Vercel.
+
+## Performance and ergonomics pass
+
+| Change | Where |
+|---|---|
+| Organization roster cached 90s, keyed per caller. Nearly every tool resolves a person's name through it, so one conversation used to fetch the identical list several times. | `src/cache.ts`, `src/tools/identity.ts` |
+| `resolveUsers` matches N names against one fetch. `list_users_with_screenshots` was a loop with an `await` inside — ten names meant ten sequential full-roster fetches. | `src/tools/identity.ts` |
+| HTTP keep-alive, so calls stop paying a fresh TLS handshake each. | `src/api/client.ts` |
+| The screenshot audit write runs in parallel with the image fetch. | `src/tools/screenshots.ts` |
+| Relative dates: `period` (`today` … `last_month`) on range tools, `today`/`yesterday` on single-day ones, resolved in the **organization** timezone. `whoami` returns `today` as the anchor. | `src/api/dates.ts` |
+| Reports carry a server-side `totals` block; rows emit durations once, as seconds, and drop empty fields — roughly half the payload. | `src/tools/timetracker.ts` |
+
+Relative dates are a correctness fix rather than a convenience. A wrong parameter returns an empty
+`200` from this backend, so a miscomputed date was indistinguishable from "this person did no work".
+
+`GET /healthz` reports `cacheBackend` alongside the auth-state fields.
 
 ## What stays imperfect on Vercel
 
@@ -90,11 +107,16 @@ non-empty `paths` list with no fetch-all option, caps the batch, defaults to thu
 every access to MeraMonitor's audit log. `submit_time_claim` is a dry run unless `confirm=true`, and
 cannot approve, reject or delete. This server exposes real employee monitoring data.
 
+The roster cache is keyed per **caller** (`roster:<orgId>:<userId>`), not per organization.
+`GetAllUserListByOrganization` is authorized by the bearer token, so an org-only key could serve one
+caller's fuller roster to another whose own request would have returned less. Do not "optimize" that
+key.
+
 ## Local development
 
 ```bash
 npm install
-npm test            # 12 date/duration assertions
+npm test            # 26 date/duration/relative-date assertions
 npm run typecheck
 cp .env.example .env
 npm run dev

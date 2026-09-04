@@ -57,16 +57,30 @@ export function buildApp(config: Config = loadConfig()): BuiltApp {
     const server = new McpServer(
       { name: 'meramonitor', version: '0.2.0' },
       {
-        instructions:
-          'MeraMonitor workforce analytics. You are already signed in - call whoami to see as whom. ' +
-          'Use list_users to turn a person name into a userId. Screenshots are listed as hourly counts ' +
-          'first; fetch actual images only for specific paths the user asks about.'
+        instructions: [
+          'MeraMonitor workforce analytics. You are already signed in - call whoami to see as ' +
+            "whom, and to get today's date in the organization's timezone.",
+          'Pass people by NAME or email directly - every tool taking a `user` argument resolves ' +
+            'it itself. You do not need list_users first.',
+          'For dates, prefer the `period` argument (today, yesterday, this_week, last_week, ' +
+            'last_7_days, last_14_days, last_30_days, this_month, last_month), and the words ' +
+            '"today" / "yesterday" for single-day tools. These resolve in the organization ' +
+            'timezone. Avoid computing dates yourself: a wrong explicit date returns an empty ' +
+            'result that is indistinguishable from no activity.',
+          'Time tracker reports carry a `totals` block - read totals rather than summing rows ' +
+            'yourself. Durations inside rows are seconds.',
+          'Screenshots are listed as hourly counts first; fetch actual images only for the ' +
+            'specific paths the user asks about.'
+        ].join('\n\n')
       }
     );
-    registerIdentityTools(server, toolContext);
-    registerScreenshotTools(server, toolContext);
-    registerTimeTrackerTools(server, toolContext);
-    registerTimeClaimTools(server, toolContext);
+    // A per-request context, so the read cache also memoises within this one
+    // request without anything outliving the response.
+    const requestContext = toolContext.forRequest();
+    registerIdentityTools(server, requestContext);
+    registerScreenshotTools(server, requestContext);
+    registerTimeTrackerTools(server, requestContext);
+    registerTimeClaimTools(server, requestContext);
     return server;
   }
 
@@ -161,7 +175,10 @@ export function buildApp(config: Config = loadConfig()): BuiltApp {
       // state can actually outlive this instance.
       stateBackend: hasRedis(config) ? 'upstash-redis' : 'in-memory',
       stateDurable: store ? store.isDurable : false,
-      redisReachable: store ? await store.ping() : null
+      redisReachable: store ? await store.ping() : null,
+      // Shared across instances, or process-local? A cold read on every call
+      // is the difference between the two.
+      cacheBackend: toolContext.cache.durable ? 'upstash-redis' : 'in-memory'
     });
   });
 

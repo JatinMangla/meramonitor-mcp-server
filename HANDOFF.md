@@ -72,6 +72,7 @@ Seven changes, because serverless shares no memory between requests:
 | `code:<code>` | authorization code | 10 minutes, deleted on use (`GETDEL`) |
 | `token:<access_token>` | issued token + bound MeraMonitor identity | `MCP_TOKEN_TTL_SECONDS` (default 28800) |
 | `refresh:<refresh_token>` | pointer to its access token | token TTL + 30 days |
+| `roster:<org_id>:<user_id>` | cached organization user list (read cache, not auth state) | 90 seconds |
 
 Without Redis credentials the store falls back to in-memory + `MCP_CLIENTS_FILE`, exactly as the
 pre-port build behaved. That path exists for local dev and the self-hosted fallback only —
@@ -115,6 +116,54 @@ All of these need a real sign-in, so they could not be reached without credentia
 - **Cold start** completing within `maxDuration` on the first call after idle.
 - **End to end.** `whoami`, `list_users`, `list_screenshot_hours`, `get_time_tracker_report`, and
   `submit_time_claim` without `confirm` (dry run — must echo the payload and send nothing).
+
+---
+
+## 2b. Performance and ergonomics pass
+
+Nine changes on top of the Vercel port. Nothing about auth, the byte budget, or the API
+conventions moved.
+
+### Faster
+
+| # | Change | Where |
+|---|---|---|
+| A | **Organization roster is cached**, 90s, keyed `roster:<orgId>:<userId>`. Nearly every tool takes a person's name and needed the full list to turn it into a userId, so a three-tool conversation about one person fetched the identical roster three times. | `src/cache.ts` (new), `src/tools/identity.ts` |
+| B | **`resolveUsers` resolves N names against ONE fetch.** `list_users_with_screenshots` was a `for` loop with an `await` inside: ten names meant ten *sequential* full-roster fetches before the real call started. It also now reports every unresolved name at once instead of throwing on the first. | `src/tools/identity.ts`, `src/tools/screenshots.ts` |
+| C | **HTTP keep-alive** on the axios instance. Every MeraMonitor call previously paid a fresh TCP + TLS handshake. | `src/api/client.ts` |
+| D | **The screenshot audit write runs in parallel** with the image fetch rather than after it. | `src/tools/screenshots.ts` |
+
+### Smarter
+
+| # | Change | Where |
+|---|---|---|
+| E | **Relative dates.** Range tools take `period` (`today`, `yesterday`, `this_week`, `last_week`, `last_7_days`, `last_14_days`, `last_30_days`, `this_month`, `last_month`); single-day tools take `today` / `yesterday`. Resolved against the **organization** timezone, not the server's. | `src/api/dates.ts` |
+| F | **`whoami` returns `today`** in the org timezone — the anchor E resolves against. | `src/tools/identity.ts` |
+| G | **Reports carry a `totals` block**, summed server-side, plus `people` and `daysCovered`. | `src/tools/timetracker.ts` |
+| H | **Report rows roughly halved.** Durations are emitted once as seconds instead of as both a formatted string and a seconds value, and null/empty fields are dropped. `totals` still carries formatted strings. | `src/tools/timetracker.ts` |
+| I | **Server instructions and tool descriptions rewritten** to say: pass names directly, prefer `period`, read `totals` rather than summing rows. | `src/app.ts`, all tool files |
+
+### Why E is a correctness fix, not a convenience
+
+Per §5, a wrong parameter returns an **empty 200**, not an error. So a miscomputed date was
+indistinguishable from "this person did no work" — the worst failure mode a reporting tool has.
+Resolving the words server-side, once, against the org timezone removes that class of silent wrong
+answer. `whoami.today` exists so the model never has to guess what "today" means on a UTC server
+for an organization most of a day away.
+
+### Two judgement calls worth knowing about
+
+- **The roster cache is keyed per CALLER, not per organization.** `GetAllUserListByOrganization` is
+  authorized by the bearer token, so what it returns can depend on who asks. An org-only key could
+  serve one caller's fuller roster to another whose own request would have returned less. Per-caller
+  keys cost hit rate and remove that class of leak. **Do not "optimize" this to an org-only key.**
+- **The screenshot audit entry is now written even if the image fetch then fails.** For an audit log
+  that is the safe direction: an unrecorded successful view is far worse than a recorded attempt
+  that returned nothing.
+
+`src/cache.ts` is deliberately separate from `OAuthStore` rather than sharing its `KvBackend`. That
+store is the auth path; a caching change must not be able to reach it. Its contract: **a cache
+failure is a miss, never an error** — Redis being down costs latency, never correctness.
 
 ---
 
@@ -174,6 +223,15 @@ Then the Vercel-specific ones:
 - [ ] **End to end.** Add the connector, sign in, run `whoami`, `list_users`,
       `list_screenshot_hours`, `get_time_tracker_report`, and `submit_time_claim` *without*
       `confirm` (dry run — must echo the payload and send nothing).
+- [x] **Date helpers.** `npm test` covers the relative-date rules against fixed anchors — week
+      boundaries on a Sunday and a Monday, month ends on a 30-day month, a February and a year
+      boundary. 26 assertions, up from 12.
+- [ ] **Cache behaviour against a real instance.** `GET /healthz` reports `cacheBackend`; it must
+      say `upstash-redis` on Vercel. Then confirm a second tool call naming the same person does
+      not re-fetch the roster, and that `list_users` still reflects a roster change immediately
+      (it deliberately bypasses the cache).
+- [ ] **Relative dates end to end.** `get_time_tracker_report` with `period: "last_week"` must
+      return the same rows as the equivalent explicit range, and echo the resolved dates back.
 
 ---
 
@@ -189,6 +247,7 @@ This server exposes real employee monitoring data. Deliberate, keep all of it:
 - `get_screenshots` requires an explicit non-empty `paths` list with **no fetch-all option**, caps
   the batch, defaults to thumbnails, and writes every access to MeraMonitor's audit log.
 - `submit_time_claim` is a dry run unless `confirm=true`, and cannot approve, reject or delete.
+- The roster cache key includes the **caller's** user id, not just the organization. See §2b.
 
 ### The 4.5 MB response cap is real
 
@@ -267,7 +326,10 @@ State these rather than discovering them later:
    budget, not removed.
 2. **Cold starts** add latency to the first call after idle.
 3. **MeraMonitor access tokens live in Upstash**, not only in server memory — a second third-party
-   processor holding credentials to production employee data.
+   processor holding credentials to production employee data. **As of the performance work this
+   also includes a 90-second cache of the organization user list** (names, emails, user ids) under
+   `roster:` keys. Short-lived and scoped per caller, but it is employee data at rest in Upstash
+   and belongs in the same compliance conversation as the tokens.
 4. **Employee screenshots transit Vercel's infrastructure.** Unavoidable on any third-party host.
 
 Items 3 and 4 are worth confirming against the SOC2/GDPR position; there is an active compliance
